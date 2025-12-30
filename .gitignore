@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Outputs / temp
+output/
+*.zip
+
+# Secrets
+.env
+
+# Git
+.gitmodules
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large ML artifacts (KEEP checkpoints if needed!)
+models/
+MODNet/
