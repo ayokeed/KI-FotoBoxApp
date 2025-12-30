@@ -26,4 +26,4 @@ RUN pip install --upgrade pip \
 COPY . /app
 
 # ---- Start ----
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --proxy-headers"]
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${WEBSITES_PORT:-8000} --proxy-headers"]
