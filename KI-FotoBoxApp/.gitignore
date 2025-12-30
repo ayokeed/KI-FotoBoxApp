@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual envs
+.venv/
+.venv2/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Secrets
+.env
+.env.*
+
+# Logs / temp / outputs
+*.log
+output/
+output/*
+outputs/
+tmp/
+temp/
+*.zip
+
+# Jupyter / caches
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pypackages__/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Images (avoid committing test images)
+*.jpg
+*.jpeg
+*.png
+*.webp
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+MANIFEST
+
+# Project-specific (U2NET etc.)
+u2net/u2net.pth
+models/u2net.pth
+
+# Large ML folders
+models/
+MODNet/
+
+# IMPORTANT:
+# Do NOT ignore checkpoints/ because your service loads:
+# checkpoints/modnet_photographic_portrait_matting.ckpt
+# If you later choose to download the ckpt in Docker build,
+# you can add: checkpoints/
