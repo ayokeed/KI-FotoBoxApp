@@ -1,4 +1,5 @@
 # pipeline/accessory_application.py
+
 import os
 import cv2
 import math
@@ -28,15 +29,9 @@ class AccessoryPlacer:
 
     def __init__(self, asset_dirs: dict):
         self.asset_dirs = asset_dirs
-        self.hat_metadata = load_metadata(
-            os.path.join(asset_dirs["hats"], "hats_metadata.json")
-        )
-        self.glasses_metadata = load_metadata(
-            os.path.join(asset_dirs["glasses"], "glasses_metadata.json")
-        )
-        self.masks_metadata = load_metadata(
-            os.path.join(asset_dirs["masks"], "masks_metadata.json")
-        )
+        self.hat_metadata = load_metadata(os.path.join(asset_dirs["hats"], "hats_metadata.json"))
+        self.glasses_metadata = load_metadata(os.path.join(asset_dirs["glasses"], "glasses_metadata.json"))
+        self.masks_metadata = load_metadata(os.path.join(asset_dirs["masks"], "masks_metadata.json"))
 
     def apply_hat(self, image, face_info, hat_name):
         hat_path = os.path.join(self.asset_dirs["hats"], f"{hat_name}.png")
@@ -46,9 +41,7 @@ class AccessoryPlacer:
             return image
         meta = self.hat_metadata.get(hat_name, {})
         left_border = meta.get("left_border", [0, hat_img.shape[0] // 2])
-        right_border = meta.get(
-            "right_border", [hat_img.shape[1], hat_img.shape[0] // 2]
-        )
+        right_border = meta.get("right_border", [hat_img.shape[1], hat_img.shape[0] // 2])
         hat_anchor = meta.get("brim", [hat_img.shape[1] // 2, hat_img.shape[0]])
         landmarks = face_info["landmarks"]
         left_eye = np.array(landmarks.get("left_eye", [0, 0]), dtype=float)
@@ -68,9 +61,7 @@ class AccessoryPlacer:
         scale = face_width / hat_inner_width
         new_width = int(hat_img.shape[1] * scale)
         new_height = int(hat_img.shape[0] * scale)
-        resized_hat = cv2.resize(
-            hat_img, (new_width, new_height), interpolation=cv2.INTER_AREA
-        )
+        resized_hat = cv2.resize(hat_img, (new_width, new_height), interpolation=cv2.INTER_AREA)
         scaled_anchor = np.array(hat_anchor, dtype=float) * scale
         extra = 150
         rotated_hat = rotate_with_canvas(resized_hat, final_angle, extra=extra)
@@ -78,9 +69,7 @@ class AccessoryPlacer:
         padded_h = new_height + 2 * extra
         center = (padded_w // 2, padded_h // 2)
         M = cv2.getRotationMatrix2D(center, final_angle, 1.0)
-        anchor_in_padded = np.array(
-            [scaled_anchor[0] + extra, scaled_anchor[1] + extra, 1.0]
-        )
+        anchor_in_padded = np.array([scaled_anchor[0] + extra, scaled_anchor[1] + extra, 1.0])
         rotated_anchor = M.dot(anchor_in_padded)
         top_left = target_anchor - rotated_anchor
         result = overlay_image(image, rotated_hat, int(top_left[0]), int(top_left[1]))
@@ -104,12 +93,8 @@ class AccessoryPlacer:
         scale = face_width / glasses_img.shape[1]
         new_width = int(glasses_img.shape[1] * scale)
         new_height = int(glasses_img.shape[0] * scale)
-        resized_glasses = cv2.resize(
-            glasses_img, (new_width, new_height), interpolation=cv2.INTER_AREA
-        )
-        angle = math.degrees(
-            math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0])
-        )
+        resized_glasses = cv2.resize(glasses_img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        angle = math.degrees(math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
         final_angle = -angle + 180
         padded_rotated = rotate_with_canvas(resized_glasses, final_angle, extra=50)
         anchor_x_scaled = anchor_x * scale + 50
@@ -137,18 +122,12 @@ class AccessoryPlacer:
         eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
         eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
         face_width = abs(right_eye[0] - left_eye[0]) * 2.5
-        mask_inner_width = np.linalg.norm(
-            np.array(left_border) - np.array(right_border)
-        )
+        mask_inner_width = np.linalg.norm(np.array(left_border) - np.array(right_border))
         scale = face_width / mask_inner_width
         new_width = int(mask_img.shape[1] * scale)
         new_height = int(mask_img.shape[0] * scale)
-        resized_mask = cv2.resize(
-            mask_img, (new_width, new_height), interpolation=cv2.INTER_AREA
-        )
-        angle = math.degrees(
-            math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0])
-        )
+        resized_mask = cv2.resize(mask_img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+        angle = math.degrees(math.atan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
         final_angle = -angle + 180
         padded_rotated = rotate_with_canvas(resized_mask, final_angle, extra=50)
         anchor_x_scaled = anchor_x * scale + 50
@@ -164,17 +143,23 @@ class AccessoryPlacer:
         if effect_img is None:
             print(f"Effect image not found: {effect_path}")
             return image
-        effect_resized = cv2.resize(
-            effect_img, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_AREA
-        )
+        effect_resized = cv2.resize(effect_img, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_AREA)
         result = overlay_image(image, effect_resized, 0, 0)
         return result
 
     def apply_accessories(self, image, face_info, accessories: dict):
-        if accessories.get("hat", "none").lower() != "none":
-            image = self.apply_hat(image, face_info, accessories["hat"])
-        if accessories.get("glasses", "none").lower() != "none":
-            image = self.apply_glasses(image, face_info, accessories["glasses"])
-        if accessories.get("masks", "none").lower() != "none":
-            image = self.apply_masks(image, face_info, accessories["masks"])
+        """
+        Accepts both "masks" and "mask" keys safely.
+        """
+        hat = accessories.get("hat", "none")
+        glasses = accessories.get("glasses", "none")
+        mask = accessories.get("masks", accessories.get("mask", "none"))
+
+        if str(hat).lower() != "none":
+            image = self.apply_hat(image, face_info, hat)
+        if str(glasses).lower() != "none":
+            image = self.apply_glasses(image, face_info, glasses)
+        if str(mask).lower() != "none":
+            image = self.apply_masks(image, face_info, mask)
+
         return image
