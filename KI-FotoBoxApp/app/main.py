@@ -12,6 +12,14 @@
 # - Assets load at startup (FAST)
 # - Heavy ML models + pipeline load lazily on first /process (or /process_image) request
 # - /suggest must remain fast and must never trigger ML loading / inference
+#
+# Azure container fix:
+# - Use an absolute, container-correct MODNet checkpoint path (/app/checkpoints/...)
+# - Keep global_vars attributes compatible with your existing pipeline (face_detector/bg_remover/accessory_placer/openai_client)
+#
+# Local dev fix:
+# - Your project currently has NO `load_all_assets` function in `pipeline.image_pipeline`
+# - So this main.py calls `pipeline.assets.load_all_assets` (you must add pipeline/assets.py)
 
 from __future__ import annotations
 
@@ -44,8 +52,9 @@ ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_BYTES = int(os.getenv("AI_MAX_IMAGE_BYTES", "15000000"))  # 15MB
 
 # Make ASSET_DIRS absolute and container-safe
-BASE_DIR = Path(__file__).resolve().parent           # .../app
-ASSETS_ROOT = (BASE_DIR / "assets").resolve()        # .../app/assets
+BASE_DIR = Path(__file__).resolve().parent              # .../KI-FotoBoxApp/app
+APP_ROOT = BASE_DIR.parent                              # .../KI-FotoBoxApp
+ASSETS_ROOT = (BASE_DIR / "assets").resolve()           # .../KI-FotoBoxApp/app/assets
 
 ASSET_DIRS = {
     "backgrounds": str(ASSETS_ROOT / "backgrounds"),
@@ -54,6 +63,9 @@ ASSET_DIRS = {
     "effects": str(ASSETS_ROOT / "effects"),
     "masks": str(ASSETS_ROOT / "masks"),
 }
+
+# MODNet checkpoint path (container-correct)
+DEFAULT_MODNET_CKPT = str((APP_ROOT / "checkpoints" / "modnet_photographic_portrait_matting.ckpt").resolve())
 
 # Global lazy-loaded pipeline
 app_pipeline = None
@@ -315,12 +327,15 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
         from pipeline.image_pipeline import ImagePipeline
         from pipeline.openai_client import OpenAI_Client
 
-        # Initialize global models
+        # Keep pipeline compatibility: set the attributes ImagePipeline expects.
         global_vars.face_detector = FaceDetector(device=device)
+
+        ckpt = os.getenv("MODNET_CKPT", "").strip() or DEFAULT_MODNET_CKPT
         global_vars.bg_remover = BackgroundRemover(
-            model_path="checkpoints/modnet_photographic_portrait_matting.ckpt",
+            model_path=ckpt,
             device=device,
         )
+
         global_vars.accessory_placer = AccessoryPlacer(ASSET_DIRS)
 
         # OpenAI client must always exist (self-disables if not configured)
@@ -338,7 +353,7 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
         app_pipeline = ImagePipeline(asset_dirs=ASSET_DIRS, device=device)
 
         print(
-            f"[AI] Models + pipeline loaded lazily. Device={device}. "
+            f"[AI] Models + pipeline loaded lazily. Device={device}. ckpt={ckpt} "
             f"USE_OPENAI={os.getenv('USE_OPENAI', '(unset)')} AI_USE_OPENAI={AI_USE_OPENAI}"
         )
 
@@ -353,8 +368,20 @@ async def lifespan_assets_only(app: FastAPI):
     Startup must be fast on Azure:
     - Load asset options + preview indexes only
     - Do NOT import/instantiate ML models here
+
+    FIXED:
+    - Your repo currently does NOT provide `load_all_assets` in pipeline.image_pipeline.
+    - Use the dedicated lightweight module: `pipeline.assets`.
+      (Create file: KI-FotoBoxApp/pipeline/assets.py)
     """
-    from pipeline.image_pipeline import load_all_assets
+    try:
+        from pipeline.assets import load_all_assets  # REQUIRED: you must add this file
+    except Exception as e:
+        raise RuntimeError(
+            "Missing pipeline.assets.load_all_assets. "
+            "Create KI-FotoBoxApp/pipeline/assets.py with load_all_assets(asset_dirs) "
+            "so FastAPI can start without importing ML code."
+        ) from e
 
     # Load asset lists once (for /suggest)
     asset_options = load_all_assets(ASSET_DIRS)
@@ -369,8 +396,10 @@ async def lifespan_assets_only(app: FastAPI):
         "masks": _build_asset_index(ASSET_DIRS["masks"]),
     }
 
-    print(f"[AI] Assets loaded. backgrounds={len(app.state.asset_indexes['backgrounds'])} "
-          f"effects={len(app.state.asset_indexes['effects'])}")
+    print(
+        f"[AI] Assets loaded. backgrounds={len(app.state.asset_indexes['backgrounds'])} "
+        f"effects={len(app.state.asset_indexes['effects'])} default_ckpt={DEFAULT_MODNET_CKPT}"
+    )
 
     yield
 
@@ -394,6 +423,9 @@ async def health_get():
         "ai_phase": AI_PHASE,
         "use_openai": os.getenv("USE_OPENAI", "(unset)"),
         "assets_root": str(ASSETS_ROOT),
+        "default_ckpt": DEFAULT_MODNET_CKPT,
+        "modnet_ckpt_env": os.getenv("MODNET_CKPT", ""),
+        "app_root": str(APP_ROOT),
     }
 
 

@@ -16,6 +16,9 @@ _bg_remover: Optional[Any] = None
 _accessory_placer: Optional[Any] = None
 _openai_client: Optional[Any] = None
 
+# Optional shared data (not required, but useful)
+asset_options: Dict[str, Any] = {}
+asset_dirs: Dict[str, str] = {}
 if TYPE_CHECKING:
     from pipeline.face_detection import FaceDetector  # noqa: F401
     from pipeline.background_removal import BackgroundRemover  # noqa: F401
