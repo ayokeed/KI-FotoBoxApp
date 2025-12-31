@@ -1,10 +1,10 @@
 # app/main.py
-# Phase 2 (step-by-step) contract-compliant AI service:
+# Phase 2 (contract-compliant AI service):
 # - POST /health  -> 200 OK
 # - POST /suggest -> returns asset-based suggestions (no filesystem paths exposed)
 # - POST /process -> returns processed image bytes (PNG) using your existing pipeline
 #
-# Keeps your legacy endpoint:
+# Keeps legacy endpoint:
 # - POST /process_image -> returns base64 results (unchanged)
 
 from __future__ import annotations
@@ -157,10 +157,6 @@ async def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
-def _safe_media_type(ct: str | None) -> str:
-    return ct if ct in ALLOWED_CONTENT_TYPES else "image/png"
-
-
 def _safe_get(d: Any, *keys: str, default=None):
     """
     Tries multiple keys on dict-like objects.
@@ -209,36 +205,68 @@ def _to_id_label_list(items: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _build_suggest_response(asset_options: Any, background_index: Dict[str, Path] | None = None) -> Dict[str, Any]:
+def _build_suggest_response(
+    asset_options: Any,
+    asset_indexes: Dict[str, Dict[str, Path]] | None = None,
+) -> Dict[str, Any]:
     """
     Build contract-compliant JSON WITHOUT exposing filesystem paths.
-    Adds previewUrl as a data URL if a background asset file exists.
+
+    Returns categories:
+      - backgrounds: [{id,label,previewUrl}]
+      - effects:     [{id,label,type,previewUrl}]
+      - hats:        [{id,label,previewUrl}]
+      - glasses:     [{id,label,previewUrl}]
+      - masks:       [{id,label,previewUrl}]
     """
-    backgrounds_raw = None
-    effects_raw = None
+    if not isinstance(asset_options, dict):
+        asset_options = {}
 
-    if isinstance(asset_options, dict):
-        backgrounds_raw = asset_options.get("backgrounds") or asset_options.get("background") or asset_options.get("bg")
-        effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
+    idxs = asset_indexes or {}
 
-    backgrounds = _to_id_label_list(backgrounds_raw)
+    def build_category(key: str) -> List[Dict[str, Any]]:
+        raw = asset_options.get(key)
+        items = _to_id_label_list(raw)
+        idx = idxs.get(key, {})
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            asset_id = it["id"]
+            out.append(
+                {
+                    "id": asset_id,
+                    "label": it["label"],
+                    "previewUrl": _preview_data_url_for_asset(asset_id, idx),
+                }
+            )
+        return out
+
+    backgrounds_out = build_category("backgrounds")
+
+    # Effects: keep your contract-friendly shape (type="filter")
+    effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
     effects_base = _to_id_label_list(effects_raw)
+    eff_idx = idxs.get("effects", {})
+    effects_out = [
+        {
+            "id": fx["id"],
+            "label": fx["label"],
+            "type": "filter",
+            "previewUrl": _preview_data_url_for_asset(fx["id"], eff_idx),
+        }
+        for fx in effects_base
+    ]
 
-    idx = background_index or {}
+    hats_out = build_category("hats")
+    glasses_out = build_category("glasses")
+    masks_out = build_category("masks")
 
-    backgrounds_out = []
-    for b in backgrounds:
-        asset_id = b["id"]
-        backgrounds_out.append(
-            {
-                "id": asset_id,
-                "label": b["label"],
-                "previewUrl": _preview_data_url_for_asset(asset_id, idx),
-            }
-        )
-
-    effects_out = [{"id": fx["id"], "label": fx["label"], "type": "filter"} for fx in effects_base]
-    return {"backgrounds": backgrounds_out, "effects": effects_out}
+    return {
+        "backgrounds": backgrounds_out,
+        "effects": effects_out,
+        "hats": hats_out,
+        "glasses": glasses_out,
+        "masks": masks_out,
+    }
 
 
 def _encode_png_bytes(img: Any) -> bytes:
@@ -299,8 +327,14 @@ async def load_models_and_pipeline(app: FastAPI):
     asset_options = load_all_assets(ASSET_DIRS)
     app.state.asset_options = asset_options
 
-    # NEW: Build preview index for backgrounds (id -> file path)
-    app.state.background_index = _build_asset_index(ASSET_DIRS["backgrounds"])
+    # Build preview indexes for all asset categories (id -> file path)
+    app.state.asset_indexes = {
+        "backgrounds": _build_asset_index(ASSET_DIRS["backgrounds"]),
+        "effects": _build_asset_index(ASSET_DIRS["effects"]),
+        "hats": _build_asset_index(ASSET_DIRS["hats"]),
+        "glasses": _build_asset_index(ASSET_DIRS["glasses"]),
+        "masks": _build_asset_index(ASSET_DIRS["masks"]),
+    }
 
     # IMPORTANT FIX:
     # Always create OpenAI_Client instance; it self-disables & falls back when USE_OPENAI=false or key missing.
@@ -344,8 +378,8 @@ async def suggest(file: UploadFile = File(...)) -> JSONResponse:
     if asset_options is None:
         raise HTTPException(status_code=503, detail="Assets not loaded yet.")
 
-    bg_index = getattr(app.state, "background_index", None)
-    payload = _build_suggest_response(asset_options, bg_index)
+    asset_indexes = getattr(app.state, "asset_indexes", None)
+    payload = _build_suggest_response(asset_options, asset_indexes)
     return JSONResponse(content=payload, status_code=200)
 
 
@@ -366,7 +400,11 @@ async def process(
     if app_pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized yet.")
 
+    # Ensure background/effects overrides are applied
     backgroundId = _normalize_override(backgroundId)
+
+    # Backend sends List[str] in Form; FastAPI can parse repeated keys.
+    # Normalize and use the first effect (pipeline currently supports one effect override).
     effects = [e for e in (effects or []) if _normalize_override(e)]
     effect_override = effects[0] if effects else None
 
@@ -442,4 +480,5 @@ async def health_get():
 
 
 if __name__ == "__main__":
+    # Local dev convenience
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
