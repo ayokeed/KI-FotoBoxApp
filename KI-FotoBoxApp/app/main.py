@@ -1,56 +1,63 @@
 # app/main.py
-# Phase 2 (contract-compliant AI service):
-# - POST /health  -> 200 OK
-# - POST /suggest -> returns asset-based suggestions (no filesystem paths exposed)
-# - POST /process -> returns processed image bytes (PNG) using your existing pipeline
+# Phase 2 (contract-compliant, Azure-safe AI service)
 #
-# Keeps legacy endpoint:
-# - POST /process_image -> returns base64 results (unchanged)
+# Endpoints:
+# - POST /health   -> 200 OK
+# - GET  /health   -> JSON status (optional convenience)
+# - POST /suggest  -> returns asset-based suggestions (NO FS paths exposed, NO ML inference)
+# - POST /process  -> returns processed image bytes (PNG)
+# - POST /process_image -> legacy base64 output (kept)
+#
+# Key architectural fix:
+# - Assets load at startup (FAST)
+# - Heavy ML models + pipeline load lazily on first /process (or /process_image) request
+# - /suggest must remain fast and must never trigger ML loading / inference
 
 from __future__ import annotations
 
 import os
 import io
-import uvicorn
 import base64
+import asyncio
 from pathlib import Path
 from typing import Optional, List, Any, Dict
 
-from contextlib import asynccontextmanager
+import uvicorn
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
 from fastapi.responses import JSONResponse
 
-# Load environment variables
 load_dotenv()
 
 # -----------------------------
 # Config
 # -----------------------------
-AI_PHASE = int(os.getenv("AI_PHASE", "2"))  # default to Phase 2 now
+AI_PHASE = int(os.getenv("AI_PHASE", "2"))
 
-# IMPORTANT:
-# Your OpenAI client uses env var "USE_OPENAI" (in pipeline/openai_client.py).
-# This AI_USE_OPENAI flag is kept only as a convenience; if it's "1" we force USE_OPENAI=true.
 AI_USE_OPENAI = os.getenv("AI_USE_OPENAI", "0") == "1"
 if AI_USE_OPENAI:
-    os.environ["USE_OPENAI"] = "true"  # ensure the OpenAI_Client feature flag sees it
+    os.environ["USE_OPENAI"] = "true"
 
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_BYTES = int(os.getenv("AI_MAX_IMAGE_BYTES", "15000000"))  # 15MB
 
-# Define the asset directories
+# Make ASSET_DIRS absolute and container-safe
+BASE_DIR = Path(__file__).resolve().parent           # .../app
+ASSETS_ROOT = (BASE_DIR / "assets").resolve()        # .../app/assets
+
 ASSET_DIRS = {
-    "backgrounds": "assets/backgrounds",
-    "hats": "assets/hats",
-    "glasses": "assets/glasses",
-    "effects": "assets/effects",
-    "masks": "assets/masks",
+    "backgrounds": str(ASSETS_ROOT / "backgrounds"),
+    "hats": str(ASSETS_ROOT / "hats"),
+    "glasses": str(ASSETS_ROOT / "glasses"),
+    "effects": str(ASSETS_ROOT / "effects"),
+    "masks": str(ASSETS_ROOT / "masks"),
 }
 
-# We'll store our ImagePipeline instance here.
+# Global lazy-loaded pipeline
 app_pipeline = None
+_pipeline_lock: asyncio.Lock | None = None
 
 
 # ==================================================
@@ -76,7 +83,6 @@ def _build_asset_index(dir_path: str) -> Dict[str, Path]:
     """
     Create { asset_id -> file_path } from an assets directory.
     asset_id is the filename without extension.
-    Example: assets/backgrounds/beach.png -> "beach"
     """
     root = Path(dir_path)
     idx: Dict[str, Path] = {}
@@ -111,7 +117,7 @@ def _preview_data_url_for_asset(asset_id: str, index: Dict[str, Path]) -> str | 
 
 
 # ==================================================
-# EXISTING HELPERS
+# GENERAL HELPERS
 # ==================================================
 
 def _normalize_override(v: str | None) -> str | None:
@@ -128,9 +134,7 @@ def _normalize_override(v: str | None) -> str | None:
 
 def _choose_device() -> str:
     """
-    Prefer CUDA when available.
-    - If you have torch installed, use torch.cuda.is_available()
-    - Otherwise, fall back to checking CUDA_VISIBLE_DEVICES
+    Prefer CUDA when available if torch exists; else CPU.
     """
     try:
         import torch  # type: ignore
@@ -158,9 +162,6 @@ async def _read_upload(file: UploadFile) -> bytes:
 
 
 def _safe_get(d: Any, *keys: str, default=None):
-    """
-    Tries multiple keys on dict-like objects.
-    """
     if not isinstance(d, dict):
         return default
     for k in keys:
@@ -170,13 +171,6 @@ def _safe_get(d: Any, *keys: str, default=None):
 
 
 def _to_id_label_list(items: Any) -> List[Dict[str, Any]]:
-    """
-    Convert arbitrary asset list structures into [{id,label}, ...].
-    Supports:
-      - ["a.jpg","b.jpg"]
-      - [{"id":"x","label":"X"}, ...]
-      - [{"name":"x"}, ...]
-    """
     out: List[Dict[str, Any]] = []
     if not items:
         return out
@@ -211,13 +205,6 @@ def _build_suggest_response(
 ) -> Dict[str, Any]:
     """
     Build contract-compliant JSON WITHOUT exposing filesystem paths.
-
-    Returns categories:
-      - backgrounds: [{id,label,previewUrl}]
-      - effects:     [{id,label,type,previewUrl}]
-      - hats:        [{id,label,previewUrl}]
-      - glasses:     [{id,label,previewUrl}]
-      - masks:       [{id,label,previewUrl}]
     """
     if not isinstance(asset_options, dict):
         asset_options = {}
@@ -242,7 +229,6 @@ def _build_suggest_response(
 
     backgrounds_out = build_category("backgrounds")
 
-    # Effects: keep your contract-friendly shape (type="filter")
     effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
     effects_base = _to_id_label_list(effects_raw)
     eff_idx = idxs.get("effects", {})
@@ -299,35 +285,82 @@ def _encode_png_bytes(img: Any) -> bytes:
     raise HTTPException(status_code=500, detail="Unsupported image type for PNG encoding.")
 
 
+# ==================================================
+# LAZY MODEL + PIPELINE LOADING (CRITICAL FIX)
+# ==================================================
+
+async def _ensure_models_loaded(app: FastAPI) -> None:
+    """
+    Load ML models + pipeline lazily.
+    This must never run from lifespan (startup), only from /process endpoints.
+    """
+    global app_pipeline, _pipeline_lock
+
+    if app_pipeline is not None:
+        return
+
+    if _pipeline_lock is None:
+        _pipeline_lock = asyncio.Lock()
+
+    async with _pipeline_lock:
+        if app_pipeline is not None:
+            return
+
+        device = _choose_device()
+
+        from pipeline.face_detection import FaceDetector
+        from pipeline.background_removal import BackgroundRemover
+        from pipeline.accessory_application import AccessoryPlacer
+        from pipeline import global_vars
+        from pipeline.image_pipeline import ImagePipeline
+        from pipeline.openai_client import OpenAI_Client
+
+        # Initialize global models
+        global_vars.face_detector = FaceDetector(device=device)
+        global_vars.bg_remover = BackgroundRemover(
+            model_path="checkpoints/modnet_photographic_portrait_matting.ckpt",
+            device=device,
+        )
+        global_vars.accessory_placer = AccessoryPlacer(ASSET_DIRS)
+
+        # OpenAI client must always exist (self-disables if not configured)
+        asset_options = getattr(app.state, "asset_options", {}) or {}
+        openai_api_key = (os.getenv("OPENAI_API_KEY", "").strip()
+                          or os.getenv("OPEN_AI_API_KEY", "").strip())
+
+        global_vars.openai_client = OpenAI_Client(
+            api_key=openai_api_key,
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            asset_options=asset_options,
+        )
+
+        # Pipeline
+        app_pipeline = ImagePipeline(asset_dirs=ASSET_DIRS, device=device)
+
+        print(
+            f"[AI] Models + pipeline loaded lazily. Device={device}. "
+            f"USE_OPENAI={os.getenv('USE_OPENAI', '(unset)')} AI_USE_OPENAI={AI_USE_OPENAI}"
+        )
+
+
+# ==================================================
+# LIFESPAN: ASSETS ONLY (FAST)
+# ==================================================
+
 @asynccontextmanager
-async def load_models_and_pipeline(app: FastAPI):
+async def lifespan_assets_only(app: FastAPI):
     """
-    Phase 2: load models once at startup.
-    Also load asset options once and cache them for /suggest.
-    IMPORTANT: global_vars.openai_client must NEVER be None (pipeline calls it).
+    Startup must be fast on Azure:
+    - Load asset options + preview indexes only
+    - Do NOT import/instantiate ML models here
     """
-    device = _choose_device()
+    from pipeline.image_pipeline import load_all_assets
 
-    from pipeline.face_detection import FaceDetector
-    from pipeline.background_removal import BackgroundRemover
-    from pipeline.accessory_application import AccessoryPlacer
-    from pipeline import global_vars
-    from pipeline.image_pipeline import ImagePipeline, load_all_assets
-    from pipeline.openai_client import OpenAI_Client
-
-    # Load global models and assign them in the global_vars module.
-    global_vars.face_detector = FaceDetector(device=device)
-    global_vars.bg_remover = BackgroundRemover(
-        model_path="checkpoints/modnet_photographic_portrait_matting.ckpt",
-        device=device,
-    )
-    global_vars.accessory_placer = AccessoryPlacer(ASSET_DIRS)
-
-    # Load asset options once (used for /suggest + deterministic fallback)
+    # Load asset lists once (for /suggest)
     asset_options = load_all_assets(ASSET_DIRS)
     app.state.asset_options = asset_options
 
-    # Build preview indexes for all asset categories (id -> file path)
+    # Build preview indexes (id -> file path)
     app.state.asset_indexes = {
         "backgrounds": _build_asset_index(ASSET_DIRS["backgrounds"]),
         "effects": _build_asset_index(ASSET_DIRS["effects"]),
@@ -336,33 +369,16 @@ async def load_models_and_pipeline(app: FastAPI):
         "masks": _build_asset_index(ASSET_DIRS["masks"]),
     }
 
-    # IMPORTANT FIX:
-    # Always create OpenAI_Client instance; it self-disables & falls back when USE_OPENAI=false or key missing.
-    openai_api_key = (
-        os.getenv("OPENAI_API_KEY", "").strip()
-        or os.getenv("OPEN_AI_API_KEY", "").strip()
-    )
-    global_vars.openai_client = OpenAI_Client(
-        api_key=openai_api_key,
-        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        asset_options=asset_options,
-    )
+    print(f"[AI] Assets loaded. backgrounds={len(app.state.asset_indexes['backgrounds'])} "
+          f"effects={len(app.state.asset_indexes['effects'])}")
 
-    # Instantiate the pipeline
-    global app_pipeline
-    app_pipeline = ImagePipeline(asset_dirs=ASSET_DIRS, device=device)
-
-    print(
-        f"Models and pipeline loaded successfully. Device={device}. "
-        f"USE_OPENAI={os.getenv('USE_OPENAI', '(unset)')} AI_USE_OPENAI={AI_USE_OPENAI}"
-    )
     yield
 
 
-app = FastAPI(lifespan=load_models_and_pipeline)
+app = FastAPI(lifespan=lifespan_assets_only)
 
 # ==================================================
-# CONTRACT ENDPOINTS (for backend integration)
+# CONTRACT ENDPOINTS
 # ==================================================
 
 @app.post("/health")
@@ -370,8 +386,22 @@ async def health_post() -> Response:
     return Response(status_code=200)
 
 
+@app.get("/health")
+async def health_get():
+    return {
+        "status": "ok",
+        "pipeline_initialized": app_pipeline is not None,
+        "ai_phase": AI_PHASE,
+        "use_openai": os.getenv("USE_OPENAI", "(unset)"),
+        "assets_root": str(ASSETS_ROOT),
+    }
+
+
 @app.post("/suggest")
 async def suggest(file: UploadFile = File(...)) -> JSONResponse:
+    """
+    Must be fast and must not trigger model loading.
+    """
     _ = await _read_upload(file)
 
     asset_options = getattr(app.state, "asset_options", None)
@@ -389,6 +419,9 @@ async def process(
     backgroundId: Optional[str] = Form(default=None),
     effects: Optional[List[str]] = Form(default=None),
 ) -> Response:
+    """
+    Returns raw PNG bytes. Loads ML lazily on first call.
+    """
     file_bytes = await _read_upload(file)
 
     try:
@@ -397,16 +430,12 @@ async def process(
     except Exception as e:
         raise HTTPException(status_code=400, detail=("Error reading the uploaded image. " + str(e)))
 
-    if app_pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline not initialized yet.")
+    await _ensure_models_loaded(app)
 
-    # Ensure background/effects overrides are applied
+    # Normalize overrides
     backgroundId = _normalize_override(backgroundId)
-
-    # Backend sends List[str] in Form; FastAPI can parse repeated keys.
-    # Normalize and use the first effect (pipeline currently supports one effect override).
-    effects = [e for e in (effects or []) if _normalize_override(e)]
-    effect_override = effects[0] if effects else None
+    effects_norm = [e for e in (effects or []) if _normalize_override(e)]
+    effect_override = effects_norm[0] if effects_norm else None
 
     try:
         results = app_pipeline.process_image(
@@ -445,8 +474,7 @@ async def process_image_endpoint(
     except Exception as e:
         raise HTTPException(status_code=400, detail=("Error reading the uploaded image. " + str(e)))
 
-    if app_pipeline is None:
-        raise HTTPException(status_code=503, detail="Pipeline not initialized yet.")
+    await _ensure_models_loaded(app)
 
     background_override = _normalize_override(background_override)
     effect_override = _normalize_override(effect_override)
@@ -466,17 +494,6 @@ async def process_image_endpoint(
 
     encoded_results = [encode_image_to_base64(img) for img in results]
     return JSONResponse(content={"results": encoded_results})
-
-
-# Optional: keep GET /health for your convenience (not part of contract)
-@app.get("/health")
-async def health_get():
-    return {
-        "status": "ok",
-        "pipeline_initialized": app_pipeline is not None,
-        "ai_phase": AI_PHASE,
-        "use_openai": os.getenv("USE_OPENAI", "(unset)"),
-    }
 
 
 if __name__ == "__main__":
