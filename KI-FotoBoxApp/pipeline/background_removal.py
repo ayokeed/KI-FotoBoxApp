@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import cv2
@@ -13,47 +14,37 @@ from torchvision import transforms
 from PIL import Image
 
 
-class BackgroundRemover:
-    """
-    Uses MODNet for background segmentation.
-    Returns a binary foreground mask (uint8: 0/255).
-    """
 
+class BackgroundRemover:
     def __init__(self, model_path: str | None = None, device: str | None = None):
-        # Lazy import: importing this module should NOT require MODNet immediately.
+        # Make MODNet's repo root importable, then import from its src/ package-style path
         try:
-            from MODNet.src.models.modnet import MODNet  # type: ignore  # noqa: N811
+            modnet_root = Path(__file__).resolve().parents[1] / "MODNet"  # /app/MODNet
+            if modnet_root.exists():
+                sys.path.insert(0, str(modnet_root))  # allows: from src.models.modnet import MODNet
+            from src.models.modnet import MODNet  # type: ignore  # noqa: N811
         except Exception as e:
             raise ModuleNotFoundError(
-                "MODNet not found in the container. Ensure the folder 'MODNet/' exists inside the Docker build context "
-                "(case-sensitive on Linux) and is copied into the image under /app/MODNet."
+                "MODNet code not importable. Ensure MODNet repo exists at /app/MODNet and contains src/models/modnet.py"
             ) from e
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        # Default checkpoint: your project path inside container should be /app/checkpoints/...
         if model_path is None or not model_path.strip():
             model_path = os.getenv("MODNET_CKPT", "").strip() or "checkpoints/modnet_photographic_portrait_matting.ckpt"
 
-        # Resolve relative paths against the container working directory (/app)
         ckpt_path = Path(model_path)
         if not ckpt_path.is_absolute():
             ckpt_path = (Path(os.getcwd()) / ckpt_path).resolve()
 
         if not ckpt_path.is_file():
-            raise FileNotFoundError(
-                f"MODNet checkpoint not found at '{ckpt_path}'. "
-                f"Include it in the Docker image (recommended: /app/checkpoints/...) "
-                f"or set MODNET_CKPT to the correct absolute path."
-            )
+            raise FileNotFoundError(f"MODNet checkpoint not found at '{ckpt_path}'")
 
         model = MODNet(backbone_pretrained=False)
-
         if self.device.type == "cuda" and torch.cuda.device_count() > 1:
             model = nn.DataParallel(model)
-
         model = model.to(self.device)
 
         state = torch.load(str(ckpt_path), map_location=self.device)
@@ -62,14 +53,10 @@ class BackgroundRemover:
 
         model.load_state_dict(state, strict=True)
         model.eval()
-
         self.model = model
 
         self._transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
-            ]
+            [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
         )
 
     def remove_background(self, image: np.ndarray) -> np.ndarray:

@@ -46,7 +46,6 @@ Thumbs.db
 !assets/**/*.jpeg
 !assets/**/*.webp
 
-
 # Build / dist
 build/
 dist/
@@ -62,8 +61,7 @@ u2net/u2net.pth
 models/u2net.pth
 
 # Large ML folders
-models/
-MODNet/
+
 
 # IMPORTANT:
 # Do NOT ignore checkpoints/ because your service loads:

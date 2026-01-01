@@ -61,8 +61,7 @@ u2net/u2net.pth
 models/u2net.pth
 
 # Large ML folders
-MODNet/
-MODNET/
+
 
 # IMPORTANT:
 # Do NOT ignore checkpoints/ because your service loads:
