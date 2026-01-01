@@ -3,16 +3,78 @@ from __future__ import annotations
 
 import os
 import sys
+import logging
 from pathlib import Path
+from typing import Any, Dict, Tuple
 
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
 
+logger = logging.getLogger(__name__)
+
+
+def _resolve_ckpt_path(model_path: str | None) -> Path:
+    """
+    Default must work in Azure container.
+    - If model_path is provided: use it.
+    - Else use env MODNET_CKPT
+    - Else default to checkpoints/modnet_photographic_portrait_matting.ckpt
+    Resolution order for relative paths:
+      1) /app/<relative> (Azure container layout)
+      2) <cwd>/<relative>
+    """
+    ckpt_str = (model_path or "").strip()
+    if not ckpt_str:
+        ckpt_str = (os.getenv("MODNET_CKPT", "").strip()
+                    or "checkpoints/modnet_photographic_portrait_matting.ckpt")
+
+    p = Path(ckpt_str)
+    if p.is_absolute():
+        return p
+
+    app_candidate = Path("/app") / p
+    if app_candidate.is_file():
+        return app_candidate
+
+    return (Path(os.getcwd()) / p).resolve()
+
+
+def _extract_state_dict(ckpt_obj: Any) -> Dict[str, torch.Tensor]:
+    """
+    Support:
+      - raw state_dict: { "layer.weight": tensor, ... }
+      - wrapped dict: { "state_dict": { ... } }
+    """
+    if isinstance(ckpt_obj, dict):
+        if "state_dict" in ckpt_obj and isinstance(ckpt_obj["state_dict"], dict):
+            return ckpt_obj["state_dict"]
+        # if it already looks like a state_dict, return it
+        if all(isinstance(k, str) for k in ckpt_obj.keys()):
+            return ckpt_obj
+
+    raise TypeError(f"Unsupported checkpoint format: {type(ckpt_obj)}")
+
+
+def _strip_module_prefix(state: Dict[str, torch.Tensor]) -> Tuple[Dict[str, torch.Tensor], bool]:
+    """
+    If the checkpoint was saved under torch.nn.DataParallel, keys are prefixed with 'module.'.
+    Strip it so it matches a normal (non-DataParallel) model.
+    """
+    keys = list(state.keys())
+    if not keys:
+        return state, False
+
+    if all(k.startswith("module.") for k in keys):
+        return {k[len("module."):]: v for k, v in state.items()}, True
+
+    if any(k.startswith("module.") for k in keys):
+        return {(k[len("module."):] if k.startswith("module.") else k): v for k, v in state.items()}, True
+
+    return state, False
 
 
 class BackgroundRemover:
@@ -20,7 +82,7 @@ class BackgroundRemover:
         # Make MODNet's repo root importable, then import from its src/ package-style path
         try:
             modnet_root = Path(__file__).resolve().parents[1] / "MODNet"  # /app/MODNet
-            if modnet_root.exists():
+            if modnet_root.exists() and str(modnet_root) not in sys.path:
                 sys.path.insert(0, str(modnet_root))  # allows: from src.models.modnet import MODNet
             from src.models.modnet import MODNet  # type: ignore  # noqa: N811
         except Exception as e:
@@ -28,29 +90,27 @@ class BackgroundRemover:
                 "MODNet code not importable. Ensure MODNet repo exists at /app/MODNet and contains src/models/modnet.py"
             ) from e
 
+        # Azure is CPU-only by default; keep auto-detect but allow override
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        if model_path is None or not model_path.strip():
-            model_path = os.getenv("MODNET_CKPT", "").strip() or "checkpoints/modnet_photographic_portrait_matting.ckpt"
-
-        ckpt_path = Path(model_path)
-        if not ckpt_path.is_absolute():
-            ckpt_path = (Path(os.getcwd()) / ckpt_path).resolve()
+        ckpt_path = _resolve_ckpt_path(model_path)
+        logger.info("MODNet checkpoint resolved to: %s", str(ckpt_path))
 
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"MODNet checkpoint not found at '{ckpt_path}'")
 
-        model = MODNet(backbone_pretrained=False)
-        if self.device.type == "cuda" and torch.cuda.device_count() > 1:
-            model = nn.DataParallel(model)
-        model = model.to(self.device)
+        # Build model (do NOT wrap in DataParallel here; normalize checkpoint instead)
+        model = MODNet(backbone_pretrained=False).to(self.device)
 
-        state = torch.load(str(ckpt_path), map_location=self.device)
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
+        # Load checkpoint on CPU first (safe on Azure), then move weights into the model
+        ckpt_obj = torch.load(str(ckpt_path), map_location="cpu")
+        state = _extract_state_dict(ckpt_obj)
+        state, stripped = _strip_module_prefix(state)
+        logger.info("MODNet checkpoint loaded. module. prefix stripped: %s", "yes" if stripped else "no")
 
+        # Fail fast on real mismatches after normalization
         model.load_state_dict(state, strict=True)
         model.eval()
         self.model = model

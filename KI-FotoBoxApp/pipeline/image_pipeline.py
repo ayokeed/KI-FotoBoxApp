@@ -140,10 +140,10 @@ class ImagePipeline:
         self._ensure_face_detector()
 
         has_overrides = any(
-            (background_override and background_override.strip()),
-            (effect_override and effect_override.strip()),
-            (accessory_override and accessory_override.strip()),
+            x is not None and str(x).strip()
+            for x in (background_override, effect_override, accessory_override)
         )
+
 
         # ---- Face detection ----
         t_faces = time.time()
