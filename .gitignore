@@ -39,11 +39,12 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Images (avoid committing test images)
-*.jpg
-*.jpeg
-*.png
-*.webp
+# --- Allow production assets (override image ignores) ---
+!assets/**
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
+!assets/**/*.webp
 
 # Build / dist
 build/
@@ -60,8 +61,8 @@ u2net/u2net.pth
 models/u2net.pth
 
 # Large ML folders
-models/
 MODNet/
+MODNET/
 
 # IMPORTANT:
 # Do NOT ignore checkpoints/ because your service loads:
