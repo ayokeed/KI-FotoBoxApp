@@ -1,0 +1,3 @@
+[submodule "KI-FotoBoxApp/MODNet"]
+	path = KI-FotoBoxApp/MODNet
+	url = https://github.com/ZHKKKe/MODNet.git
