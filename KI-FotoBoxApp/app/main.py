@@ -1,41 +1,30 @@
 # app/main.py
 # Phase 2 (contract-compliant, Azure-safe AI service)
 #
-# Endpoints:
-# - POST /health   -> 200 OK
-# - GET  /health   -> JSON status (optional convenience)
-# - POST /suggest  -> returns asset-based suggestions (NO FS paths exposed, NO ML inference)
-# - POST /process  -> returns processed image bytes (PNG)
-# - POST /process_image -> legacy base64 output (kept)
+# CHANGE FOR OPTION A:
+# - /suggest returns SHORT HTTP previewUrl (no base64)
+# - NEW: GET /assets/{category}/{asset_id} serves preview bytes
 #
-# Key architectural fix:
-# - Assets load at startup (FAST)
-# - Heavy ML models + pipeline load lazily on first /process (or /process_image) request
-# - /suggest must remain fast and must never trigger ML loading / inference
-#
-# Azure container fix:
-# - Use an absolute, container-correct MODNet checkpoint path (/app/checkpoints/...)
-# - Keep global_vars attributes compatible with your existing pipeline (face_detector/bg_remover/accessory_placer/openai_client)
-#
-# Local dev fix:
-# - Your project currently has NO `load_all_assets` function in `pipeline.image_pipeline`
-# - So this main.py calls `pipeline.assets.load_all_assets` (you must add pipeline/assets.py)
+# Non-negotiables kept:
+# - No FS paths exposed
+# - /suggest stays fast and must not load ML
+# - ML loads lazily only on /process or /process_image
 
 from __future__ import annotations
 
 import os
 import io
-import base64
 import asyncio
 from pathlib import Path
-from typing import Optional, List, Any, Dict
+from typing import Optional, List, Any, Dict, Tuple
 
 import uvicorn
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
@@ -51,18 +40,29 @@ if AI_USE_OPENAI:
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_BYTES = int(os.getenv("AI_MAX_IMAGE_BYTES", "15000000"))  # 15MB
 
+# Prefer explicit public base URL behind proxies (Azure). Example:
+# PUBLIC_BASE_URL=https://photobooth-ai-service-xxxx.azurewebsites.net
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+
+# CORS (only needed if browser fetches /assets/* or /suggest directly)
+# Example:
+# CORS_ORIGINS=https://your-frontend-host,https://your-backend-host
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+
 # Make ASSET_DIRS absolute and container-safe
 BASE_DIR = Path(__file__).resolve().parent              # .../KI-FotoBoxApp/app
 APP_ROOT = BASE_DIR.parent                              # .../KI-FotoBoxApp
-ASSETS_ROOT = (BASE_DIR / "assets").resolve()           # .../KI-FotoBoxApp/app/assets
+ASSETS_ROOT = (APP_ROOT / "assets").resolve()
 
 ASSET_DIRS = {
     "backgrounds": str(ASSETS_ROOT / "backgrounds"),
-    "hats": str(ASSETS_ROOT / "hats"),
-    "glasses": str(ASSETS_ROOT / "glasses"),
-    "effects": str(ASSETS_ROOT / "effects"),
-    "masks": str(ASSETS_ROOT / "masks"),
+    "hats":        str(ASSETS_ROOT / "hats"),
+    "glasses":     str(ASSETS_ROOT / "glasses"),
+    "effects":     str(ASSETS_ROOT / "effects"),
+    "masks":       str(ASSETS_ROOT / "masks"),
 }
+
+ALLOWED_CATEGORIES = set(ASSET_DIRS.keys())
 
 # MODNet checkpoint path (container-correct)
 DEFAULT_MODNET_CKPT = str((APP_ROOT / "checkpoints" / "modnet_photographic_portrait_matting.ckpt").resolve())
@@ -73,69 +73,10 @@ _pipeline_lock: asyncio.Lock | None = None
 
 
 # ==================================================
-# PREVIEW HELPERS (no filesystem paths exposed)
-# ==================================================
-
-def _guess_image_mime_from_path(p: Path) -> str:
-    ext = p.suffix.lower()
-    if ext == ".png":
-        return "image/png"
-    if ext in {".jpg", ".jpeg"}:
-        return "image/jpeg"
-    if ext == ".webp":
-        return "image/webp"
-    return "application/octet-stream"
-
-
-def _file_bytes_to_data_url(data: bytes, mime: str) -> str:
-    return f"data:{mime};base64," + base64.b64encode(data).decode("utf-8")
-
-
-def _build_asset_index(dir_path: str) -> Dict[str, Path]:
-    """
-    Create { asset_id -> file_path } from an assets directory.
-    asset_id is the filename without extension.
-    """
-    root = Path(dir_path)
-    idx: Dict[str, Path] = {}
-    if not root.exists() or not root.is_dir():
-        return idx
-
-    for p in root.rglob("*"):
-        if not p.is_file():
-            continue
-        if p.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
-            continue
-        idx[p.stem] = p
-    return idx
-
-
-def _preview_data_url_for_asset(asset_id: str, index: Dict[str, Path]) -> str | None:
-    """
-    Returns a data URL like: data:image/png;base64,...
-    Never returns filesystem paths.
-    """
-    p = index.get(asset_id)
-    if p is None:
-        return None
-    try:
-        data = p.read_bytes()
-        if not data:
-            return None
-        mime = _guess_image_mime_from_path(p)
-        return _file_bytes_to_data_url(data, mime)
-    except Exception:
-        return None
-
-
-# ==================================================
 # GENERAL HELPERS
 # ==================================================
 
 def _normalize_override(v: str | None) -> str | None:
-    """
-    Treat bad frontend defaults like 'string' as no override.
-    """
     if v is None:
         return None
     v = v.strip()
@@ -145,9 +86,6 @@ def _normalize_override(v: str | None) -> str | None:
 
 
 def _choose_device() -> str:
-    """
-    Prefer CUDA when available if torch exists; else CPU.
-    """
     try:
         import torch  # type: ignore
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -156,10 +94,6 @@ def _choose_device() -> str:
 
 
 async def _read_upload(file: UploadFile) -> bytes:
-    """
-    Read and validate multipart image upload.
-    Contract uses field name: file
-    """
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
@@ -211,71 +145,18 @@ def _to_id_label_list(items: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def _build_suggest_response(
-    asset_options: Any,
-    asset_indexes: Dict[str, Dict[str, Path]] | None = None,
-) -> Dict[str, Any]:
-    """
-    Build contract-compliant JSON WITHOUT exposing filesystem paths.
-    """
-    if not isinstance(asset_options, dict):
-        asset_options = {}
-
-    idxs = asset_indexes or {}
-
-    def build_category(key: str) -> List[Dict[str, Any]]:
-        raw = asset_options.get(key)
-        items = _to_id_label_list(raw)
-        idx = idxs.get(key, {})
-        out: List[Dict[str, Any]] = []
-        for it in items:
-            asset_id = it["id"]
-            out.append(
-                {
-                    "id": asset_id,
-                    "label": it["label"],
-                    "previewUrl": _preview_data_url_for_asset(asset_id, idx),
-                }
-            )
-        return out
-
-    backgrounds_out = build_category("backgrounds")
-
-    effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
-    effects_base = _to_id_label_list(effects_raw)
-    eff_idx = idxs.get("effects", {})
-    effects_out = [
-        {
-            "id": fx["id"],
-            "label": fx["label"],
-            "type": "filter",
-            "previewUrl": _preview_data_url_for_asset(fx["id"], eff_idx),
-        }
-        for fx in effects_base
-    ]
-
-    hats_out = build_category("hats")
-    glasses_out = build_category("glasses")
-    masks_out = build_category("masks")
-
-    return {
-        "backgrounds": backgrounds_out,
-        "effects": effects_out,
-        "hats": hats_out,
-        "glasses": glasses_out,
-        "masks": masks_out,
-    }
+def _base_url(request: Request) -> str:
+    # best behind Azure is to set PUBLIC_BASE_URL explicitly
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    # request.base_url ends with "/"
+    return str(request.base_url).rstrip("/")
 
 
 def _encode_png_bytes(img: Any) -> bytes:
-    """
-    Encode an image object to PNG bytes.
-    Tries OpenCV (numpy array) first, then PIL.
-    """
     try:
         import cv2  # type: ignore
         import numpy as np  # type: ignore
-
         if isinstance(img, np.ndarray):
             ok, buf = cv2.imencode(".png", img)
             if not ok:
@@ -286,7 +167,6 @@ def _encode_png_bytes(img: Any) -> bytes:
 
     try:
         from PIL import Image  # type: ignore
-
         if isinstance(img, Image.Image):
             bio = io.BytesIO()
             img.save(bio, format="PNG")
@@ -302,10 +182,6 @@ def _encode_png_bytes(img: Any) -> bytes:
 # ==================================================
 
 async def _ensure_models_loaded(app: FastAPI) -> None:
-    """
-    Load ML models + pipeline lazily.
-    This must never run from lifespan (startup), only from /process endpoints.
-    """
     global app_pipeline, _pipeline_lock
 
     if app_pipeline is not None:
@@ -327,18 +203,13 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
         from pipeline.image_pipeline import ImagePipeline
         from pipeline.openai_client import OpenAI_Client
 
-        # Keep pipeline compatibility: set the attributes ImagePipeline expects.
         global_vars.face_detector = FaceDetector(device=device)
 
         ckpt = os.getenv("MODNET_CKPT", "").strip() or DEFAULT_MODNET_CKPT
-        global_vars.bg_remover = BackgroundRemover(
-            model_path=ckpt,
-            device=device,
-        )
+        global_vars.bg_remover = BackgroundRemover(model_path=ckpt, device=device)
 
         global_vars.accessory_placer = AccessoryPlacer(ASSET_DIRS)
 
-        # OpenAI client must always exist (self-disables if not configured)
         asset_options = getattr(app.state, "asset_options", {}) or {}
         openai_api_key = (os.getenv("OPENAI_API_KEY", "").strip()
                           or os.getenv("OPEN_AI_API_KEY", "").strip())
@@ -349,13 +220,78 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
             asset_options=asset_options,
         )
 
-        # Pipeline
         app_pipeline = ImagePipeline(asset_dirs=ASSET_DIRS, device=device)
 
         print(
             f"[AI] Models + pipeline loaded lazily. Device={device}. ckpt={ckpt} "
             f"USE_OPENAI={os.getenv('USE_OPENAI', '(unset)')} AI_USE_OPENAI={AI_USE_OPENAI}"
         )
+
+
+# ==================================================
+# SUGGEST RESPONSE (OPTION A: short HTTP previewUrl)
+# ==================================================
+
+def _build_suggest_response_option_a(
+    request: Request,
+    asset_options: Any,
+    asset_index: Dict[str, Dict[str, Dict[str, str]]] | None = None,
+) -> Dict[str, Any]:
+    """
+    Contract-compliant JSON WITHOUT exposing filesystem paths.
+    previewUrl is a short HTTP URL:
+      {base}/assets/{category}/{asset_id}
+    If asset_id has no real file (e.g., 'none'), previewUrl is None.
+    """
+    if not isinstance(asset_options, dict):
+        asset_options = {}
+
+    base = _base_url(request)
+    idx = asset_index or {}
+
+    def has_preview(category: str, asset_id: str) -> bool:
+        if asset_id.lower() == "none":
+            return False
+        return asset_id in (idx.get(category) or {})
+
+    def cat_items(category: str) -> List[Dict[str, Any]]:
+        raw = asset_options.get(category)
+        items = _to_id_label_list(raw)
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            aid = it["id"]
+            out.append(
+                {
+                    "id": aid,
+                    "label": it["label"],
+                    "previewUrl": (f"{base}/assets/{category}/{aid}" if has_preview(category, aid) else None),
+                }
+            )
+        return out
+
+    backgrounds_out = cat_items("backgrounds")
+
+    effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
+    effects_base = _to_id_label_list(effects_raw)
+    effects_out = []
+    for fx in effects_base:
+        aid = fx["id"]
+        effects_out.append(
+            {
+                "id": aid,
+                "label": fx["label"],
+                "type": "filter",
+                "previewUrl": (f"{base}/assets/effects/{aid}" if has_preview("effects", aid) else None),
+            }
+        )
+
+    return {
+        "backgrounds": backgrounds_out,
+        "effects": effects_out,
+        "hats": cat_items("hats"),
+        "glasses": cat_items("glasses"),
+        "masks": cat_items("masks"),
+    }
 
 
 # ==================================================
@@ -366,45 +302,46 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
 async def lifespan_assets_only(app: FastAPI):
     """
     Startup must be fast on Azure:
-    - Load asset options + preview indexes only
+    - Load asset options + build preview index only
     - Do NOT import/instantiate ML models here
-
-    FIXED:
-    - Your repo currently does NOT provide `load_all_assets` in pipeline.image_pipeline.
-    - Use the dedicated lightweight module: `pipeline.assets`.
-      (Create file: KI-FotoBoxApp/pipeline/assets.py)
     """
     try:
-        from pipeline.assets import load_all_assets  # REQUIRED: you must add this file
+        from pipeline.assets import load_all_assets, build_asset_preview_index
     except Exception as e:
         raise RuntimeError(
-            "Missing pipeline.assets.load_all_assets. "
-            "Create KI-FotoBoxApp/pipeline/assets.py with load_all_assets(asset_dirs) "
-            "so FastAPI can start without importing ML code."
+            "Missing pipeline.assets functions. Ensure KI-FotoBoxApp/pipeline/assets.py defines:\n"
+            "- load_all_assets(asset_dirs) -> dict\n"
+            "- build_asset_preview_index(asset_dirs) -> dict\n"
         ) from e
 
-    # Load asset lists once (for /suggest)
-    asset_options = load_all_assets(ASSET_DIRS)
-    app.state.asset_options = asset_options
+    app.state.asset_options = load_all_assets(ASSET_DIRS)
+    app.state.asset_preview_index = build_asset_preview_index(ASSET_DIRS)
 
-    # Build preview indexes (id -> file path)
-    app.state.asset_indexes = {
-        "backgrounds": _build_asset_index(ASSET_DIRS["backgrounds"]),
-        "effects": _build_asset_index(ASSET_DIRS["effects"]),
-        "hats": _build_asset_index(ASSET_DIRS["hats"]),
-        "glasses": _build_asset_index(ASSET_DIRS["glasses"]),
-        "masks": _build_asset_index(ASSET_DIRS["masks"]),
-    }
-
+    # log counts to detect missing assets in Docker
+    idx = app.state.asset_preview_index
     print(
-        f"[AI] Assets loaded. backgrounds={len(app.state.asset_indexes['backgrounds'])} "
-        f"effects={len(app.state.asset_indexes['effects'])} default_ckpt={DEFAULT_MODNET_CKPT}"
+        "[AI] Assets loaded. "
+        + " ".join([f"{k}={len(idx.get(k, {}))}" for k in sorted(ALLOWED_CATEGORIES)])
+        + f" assets_root={ASSETS_ROOT} default_ckpt={DEFAULT_MODNET_CKPT}"
     )
 
     yield
 
 
 app = FastAPI(lifespan=lifespan_assets_only)
+
+# CORS only if needed (browser fetch)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["*"],
+        expose_headers=["Content-Type"],
+        max_age=600,
+    )
+
 
 # ==================================================
 # CONTRACT ENDPOINTS
@@ -417,6 +354,7 @@ async def health_post() -> Response:
 
 @app.get("/health")
 async def health_get():
+    idx = getattr(app.state, "asset_preview_index", {}) or {}
     return {
         "status": "ok",
         "pipeline_initialized": app_pipeline is not None,
@@ -426,13 +364,49 @@ async def health_get():
         "default_ckpt": DEFAULT_MODNET_CKPT,
         "modnet_ckpt_env": os.getenv("MODNET_CKPT", ""),
         "app_root": str(APP_ROOT),
+        "assets_count": {k: len(idx.get(k, {})) for k in sorted(ALLOWED_CATEGORIES)},
+        "public_base_url": PUBLIC_BASE_URL,
+        "cors_origins": CORS_ORIGINS,
     }
 
 
+# NEW: Option A preview endpoint
+@app.get("/assets/{category}/{asset_id}")
+async def get_asset_preview(category: str, asset_id: str):
+    if category not in ALLOWED_CATEGORIES:
+        raise HTTPException(status_code=404, detail="Unknown category")
+
+    if asset_id.lower() == "none":
+        raise HTTPException(status_code=404, detail="No preview for 'none'")
+
+    index = getattr(app.state, "asset_preview_index", {}) or {}
+    cat = index.get(category) or {}
+    meta = cat.get(asset_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    # meta contains internal path + mime; never return the path
+    path = meta.get("path")
+    mime = meta.get("mime") or "application/octet-stream"
+    if not path or not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Asset missing on disk")
+
+    def _iterfile():
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(256 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(_iterfile(), media_type=mime)
+
+
 @app.post("/suggest")
-async def suggest(file: UploadFile = File(...)) -> JSONResponse:
+async def suggest(request: Request, file: UploadFile = File(...)) -> JSONResponse:
     """
     Must be fast and must not trigger model loading.
+    Now returns SHORT HTTP preview URLs (Option A).
     """
     _ = await _read_upload(file)
 
@@ -440,8 +414,8 @@ async def suggest(file: UploadFile = File(...)) -> JSONResponse:
     if asset_options is None:
         raise HTTPException(status_code=503, detail="Assets not loaded yet.")
 
-    asset_indexes = getattr(app.state, "asset_indexes", None)
-    payload = _build_suggest_response(asset_options, asset_indexes)
+    asset_index = getattr(app.state, "asset_preview_index", None)
+    payload = _build_suggest_response_option_a(request, asset_options, asset_index)
     return JSONResponse(content=payload, status_code=200)
 
 
@@ -451,9 +425,6 @@ async def process(
     backgroundId: Optional[str] = Form(default=None),
     effects: Optional[List[str]] = Form(default=None),
 ) -> Response:
-    """
-    Returns raw PNG bytes. Loads ML lazily on first call.
-    """
     file_bytes = await _read_upload(file)
 
     try:
@@ -464,7 +435,6 @@ async def process(
 
     await _ensure_models_loaded(app)
 
-    # Normalize overrides
     backgroundId = _normalize_override(backgroundId)
     effects_norm = [e for e in (effects or []) if _normalize_override(e)]
     effect_override = effects_norm[0] if effects_norm else None
@@ -488,9 +458,6 @@ async def process(
     return Response(content=out_bytes, media_type="image/png", status_code=200)
 
 
-# ==================================================
-# LEGACY ENDPOINT (keep for your local UI/testing)
-# ==================================================
 @app.post("/process_image")
 async def process_image_endpoint(
     image: UploadFile = File(...),
@@ -501,7 +468,6 @@ async def process_image_endpoint(
     try:
         file_bytes = await image.read()
         from pipeline.image_utils import read_imagefile, encode_image_to_base64
-
         input_image = read_imagefile(file_bytes)
     except Exception as e:
         raise HTTPException(status_code=400, detail=("Error reading the uploaded image. " + str(e)))
@@ -529,5 +495,4 @@ async def process_image_endpoint(
 
 
 if __name__ == "__main__":
-    # Local dev convenience
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
