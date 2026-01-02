@@ -55,12 +55,15 @@ APP_ROOT = BASE_DIR.parent                              # .../KI-FotoBoxApp
 ASSETS_ROOT = (APP_ROOT / "assets").resolve()
 
 ASSET_DIRS = {
-    "backgrounds": str(ASSETS_ROOT / "backgrounds"),
-    "hats":        str(ASSETS_ROOT / "hats"),
-    "glasses":     str(ASSETS_ROOT / "glasses"),
-    "effects":     str(ASSETS_ROOT / "effects"),
-    "masks":       str(ASSETS_ROOT / "masks"),
+    "backgrounds":        str(ASSETS_ROOT / "backgrounds"),
+    "event_backgrounds":  str(ASSETS_ROOT / "event_backgrounds"),
+    "hats":               str(ASSETS_ROOT / "hats"),
+    "glasses":            str(ASSETS_ROOT / "glasses"),
+    "effects":            str(ASSETS_ROOT / "effects"),
+    "event_effects":      str(ASSETS_ROOT / "event_effects"),
+    "masks":              str(ASSETS_ROOT / "masks"),
 }
+
 
 ALLOWED_CATEGORIES = set(ASSET_DIRS.keys())
 

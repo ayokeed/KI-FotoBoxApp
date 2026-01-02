@@ -1,4 +1,4 @@
-# pipeline/image_pipeline.py  (UPDATED - supports both normal + event assets, better logging, optional strict override validation)
+# pipeline/image_pipeline.py  (UPDATED - absolute event dirs via asset_dirs + no OpenCV imread WARN spam)
 from __future__ import annotations
 
 import os
@@ -18,22 +18,23 @@ from pipeline import global_vars
 def _norm_id(x: Optional[str]) -> str:
     return (x or "").strip()
 
-
-def _try_read_image_by_id(dir_path: str, asset_id: str, exts=(".png", ".jpg", ".jpeg")) -> Tuple[Optional[any], Optional[str]]:
+def _try_find_file_by_id(
+    dir_path: str,
+    asset_id: str,
+    exts=(".png", ".jpg", ".jpeg"),
+) -> Optional[str]:
     """
-    Try to load an image file by id (filename without extension) from a directory.
-    Returns (img, full_path) or (None, None).
+    Find an asset file by id (filename without extension) without calling cv2.imread.
+    This avoids OpenCV WARN spam when files are missing.
+    Returns full path or None.
     """
     if not dir_path or not asset_id:
-        return None, None
-
+        return None
     for ext in exts:
         p = os.path.join(dir_path, asset_id + ext)
-        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-        if img is not None:
-            return img, p
-    return None, None
-
+        if os.path.isfile(p):
+            return p
+    return None
 
 def _resolve_asset_file(
     asset_id: str,
@@ -45,8 +46,8 @@ def _resolve_asset_file(
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Resolve an asset file path by checking:
-      1) primary_dir (e.g. assets/event_backgrounds)
-      2) fallback_dir (e.g. assets/backgrounds)
+      1) primary_dir (e.g. /app/assets/event_backgrounds)
+      2) fallback_dir (e.g. /app/assets/backgrounds)
 
     Returns (path, where) where 'where' is the directory used ("primary"|"fallback").
     If strict=True, raises ValueError when not found.
@@ -55,11 +56,11 @@ def _resolve_asset_file(
     if not asset_id or asset_id.lower() == "none":
         return None, None
 
-    _, p1 = _try_read_image_by_id(primary_dir, asset_id, exts=exts)
+    p1 = _try_find_file_by_id(primary_dir, asset_id, exts=exts)
     if p1:
         return p1, "primary"
 
-    _, p2 = _try_read_image_by_id(fallback_dir, asset_id, exts=exts)
+    p2 = _try_find_file_by_id(fallback_dir, asset_id, exts=exts)
     if p2:
         return p2, "fallback"
 
@@ -69,7 +70,6 @@ def _resolve_asset_file(
     print(msg)
     return None, None
 
-
 def _safe_fallback_suggestions():
     from models.image_tags import ImageTagsResponse, ImageTags
 
@@ -78,7 +78,6 @@ def _safe_fallback_suggestions():
         suggestion2=ImageTags(Background="none", Hats="none", Glasses="none", Effects="none", Masks="none"),
         suggestion3=ImageTags(Background="none", Hats="none", Glasses="none", Effects="none", Masks="none"),
     )
-
 
 def _single_suggestion_from_overrides(
     background_override: Optional[str],
@@ -94,7 +93,7 @@ def _single_suggestion_from_overrides(
     bg = _norm_id(background_override) or "none"
     eff = _norm_id(effect_override) or "none"
 
-    # If accessory_override is provided, keep hats/glasses/masks as none for now (existing behavior)
+    # Accessory override not used yet (kept for compatibility)
     if _norm_id(accessory_override):
         return ImageTags(Background=bg, Hats="none", Glasses="none", Effects=eff, Masks="none")
 
@@ -126,12 +125,10 @@ class ImagePipeline:
         self.accessory_placer = None
         self.openai_client = None
 
-        # Asset options should be prepared by FastAPI lifespan using pipeline/assets.py
-        # and stored into global_vars.
+        # Asset options prepared by FastAPI lifespan using pipeline/assets.py
         self.asset_options = global_vars.get_asset_options() or {}
 
-        # Toggle strict asset validation for overrides:
-        # - If true and an override id is provided but the file doesn't exist -> raise (so you stop getting "unchanged but 200 OK").
+        # If true and an override id is provided but the file doesn't exist -> raise
         self.strict_override_assets = str(os.environ.get("STRICT_OVERRIDE_ASSETS", "0")).lower() in ("1", "true", "yes", "y")
 
     def _ensure_face_detector(self):
@@ -286,7 +283,8 @@ class ImagePipeline:
         """
         Apply one suggestion deterministically.
         - Supports BOTH event_* and normal asset folders.
-        - Does NOT mutate global asset_dirs when using overrides.
+        - Uses asset_dirs["event_*"] if present (no hardcoded relative paths).
+        - Avoids OpenCV WARN spam by testing existence with os.path.isfile.
         - Lazy loads bg remover only if background replacement is actually needed.
         """
         edited_image = image.copy()
@@ -303,18 +301,16 @@ class ImagePipeline:
             suggestion.Effects = eff_override
             print(f"[DEBUG] override effectId='{eff_override}'")
 
-        # Decide directories (event first, then fallback)
-        # If your asset_dirs already contains "backgrounds"/"effects", use them as fallback.
-        fallback_bg_dir = self.asset_dirs.get("backgrounds", "assets/backgrounds")
-        fallback_eff_dir = self.asset_dirs.get("effects", "assets/effects")
+        # Directories (event first, then fallback)
+        fallback_bg_dir = self.asset_dirs.get("backgrounds", "/app/assets/backgrounds")
+        fallback_eff_dir = self.asset_dirs.get("effects", "/app/assets/effects")
 
-        event_bg_dir = "assets/event_backgrounds"
-        event_eff_dir = "assets/event_effects"
+        event_bg_dir = self.asset_dirs.get("event_backgrounds") or ""
+        event_eff_dir = self.asset_dirs.get("event_effects") or ""
 
         # Background replacement (only if not 'none')
         bg_id = _norm_id(getattr(suggestion, "Background", None))
         if bg_id and bg_id.lower() != "none":
-            # Resolve background file path (event -> fallback)
             bg_path, where = _resolve_asset_file(
                 asset_id=bg_id,
                 primary_dir=event_bg_dir,
@@ -340,13 +336,13 @@ class ImagePipeline:
 
                     mask = self.bg_remover.remove_background(edited_image)
 
-                    # Ensure mask is single channel uint8
                     if mask is None:
                         msg = "bg_remover.remove_background returned None."
                         if self.strict_override_assets and bool(bg_override):
                             raise ValueError(msg)
                         print(msg)
                     else:
+                        # Ensure mask is single channel uint8
                         if len(mask.shape) == 3:
                             mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
                         if mask.dtype != "uint8":
@@ -377,8 +373,6 @@ class ImagePipeline:
         # Apply overall effect overlay
         effect_id = _norm_id(accessories.get("effect", None))
         if effect_id and effect_id.lower() != "none":
-            # Optional: resolve effect file ahead of time for better logs / strict handling.
-            # If your accessory_placer.apply_effect already resolves files internally, this still helps debugging.
             eff_path, where = _resolve_asset_file(
                 asset_id=effect_id,
                 primary_dir=event_eff_dir,
@@ -387,18 +381,20 @@ class ImagePipeline:
                 exts=(".png", ".jpg", ".jpeg"),
                 strict=self.strict_override_assets and bool(eff_override),
             )
+
             if eff_path:
                 print(f"[DEBUG] effect resolved ({where}) -> {eff_path}")
+                # Ensure accessory_placer resolves from the correct directory
+                try:
+                    self.accessory_placer.asset_dirs["effects"] = event_eff_dir if where == "primary" else fallback_eff_dir
+                except Exception:
+                    pass
             else:
                 print(f"[DEBUG] effect '{effect_id}' not found in event/fallback dirs (apply_effect may no-op).")
-
-            # Make sure accessory_placer sees the fallback dirs (do not force event dirs).
-            # Your accessory_placer should be able to resolve using self.asset_dirs["effects"].
-            # If it can only use one dir, prefer fallback_eff_dir here and let _resolve_asset_file ensure existence.
-            try:
-                self.accessory_placer.asset_dirs["effects"] = fallback_eff_dir
-            except Exception:
-                pass
+                try:
+                    self.accessory_placer.asset_dirs["effects"] = fallback_eff_dir
+                except Exception:
+                    pass
 
             edited_image = self.accessory_placer.apply_effect(edited_image, effect_id)
 
