@@ -19,8 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # ---- Python deps ----
 COPY requirements.txt /app/requirements.txt
-COPY KI-FotoBoxApp/assets /app/assets
-
+COPY assets /app/assets
 RUN pip install --upgrade pip \
  && pip install --no-cache-dir -r /app/requirements.txt
 
