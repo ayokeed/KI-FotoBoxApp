@@ -1,9 +1,13 @@
 # app/main.py
 # Phase 2 (contract-compliant, Azure-safe AI service)
 #
-# CHANGE FOR OPTION A:
-# - /suggest returns SHORT HTTP previewUrl (no base64)
-# - NEW: GET /assets/{category}/{asset_id} serves preview bytes
+# UPDATED FOR ACCESSORIES CONTRACT:
+# - /suggest returns: backgrounds, effects, accessories   (unified list)
+# - GET /assets/{category}/{asset_id} serves preview bytes (no FS paths exposed)
+# - /process accepts:
+#     - backgroundId (string)
+#     - effects (repeated form fields)  -> kept
+#     - accessories (single form field JSON string) -> NEW
 #
 # Non-negotiables kept:
 # - No FS paths exposed
@@ -16,7 +20,7 @@ import os
 import io
 import asyncio
 from pathlib import Path
-from typing import Optional, List, Any, Dict, Tuple
+from typing import Optional, List, Any, Dict
 
 import uvicorn
 from dotenv import load_dotenv
@@ -63,7 +67,6 @@ ASSET_DIRS = {
     "event_effects":      str(ASSETS_ROOT / "event_effects"),
     "masks":              str(ASSETS_ROOT / "masks"),
 }
-
 
 ALLOWED_CATEGORIES = set(ASSET_DIRS.keys())
 
@@ -149,10 +152,8 @@ def _to_id_label_list(items: Any) -> List[Dict[str, Any]]:
 
 
 def _base_url(request: Request) -> str:
-    # best behind Azure is to set PUBLIC_BASE_URL explicitly
     if PUBLIC_BASE_URL:
         return PUBLIC_BASE_URL
-    # request.base_url ends with "/"
     return str(request.base_url).rstrip("/")
 
 
@@ -178,6 +179,41 @@ def _encode_png_bytes(img: Any) -> bytes:
         pass
 
     raise HTTPException(status_code=500, detail="Unsupported image type for PNG encoding.")
+
+
+def _parse_accessories_json(accessories_json: str | None) -> List[Dict[str, Any]]:
+    """
+    accessories is sent as ONE multipart field containing JSON:
+      '[{"id":"round_glasses","scale":1.1,"rotation":0}]'
+    """
+    accessories_json = _normalize_override(accessories_json)
+    if not accessories_json:
+        return []
+
+    try:
+        import json
+        data = json.loads(accessories_json)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid accessories JSON. {str(e)}")
+
+    if data is None:
+        return []
+
+    if isinstance(data, dict):
+        data = [data]
+
+    if not isinstance(data, list):
+        raise HTTPException(status_code=400, detail="Invalid accessories JSON: expected array.")
+
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        aid = item.get("id") or item.get("name")
+        if not aid or not isinstance(aid, str):
+            continue
+        out.append(item)
+    return out
 
 
 # ==================================================
@@ -232,7 +268,7 @@ async def _ensure_models_loaded(app: FastAPI) -> None:
 
 
 # ==================================================
-# SUGGEST RESPONSE (OPTION A: short HTTP previewUrl)
+# SUGGEST RESPONSE (Option A: short HTTP previewUrl)
 # ==================================================
 
 def _build_suggest_response_option_a(
@@ -244,7 +280,11 @@ def _build_suggest_response_option_a(
     Contract-compliant JSON WITHOUT exposing filesystem paths.
     previewUrl is a short HTTP URL:
       {base}/assets/{category}/{asset_id}
-    If asset_id has no real file (e.g., 'none'), previewUrl is None.
+
+    Returns unified:
+      - backgrounds: [{id,label,previewUrl}]
+      - effects:     [{id,label,type,previewUrl}]
+      - accessories: [{id,label,category,previewUrl,params}]
     """
     if not isinstance(asset_options, dict):
         asset_options = {}
@@ -272,11 +312,13 @@ def _build_suggest_response_option_a(
             )
         return out
 
+    # Backgrounds
     backgrounds_out = cat_items("backgrounds")
 
+    # Effects
     effects_raw = asset_options.get("effects") or asset_options.get("filters") or asset_options.get("fx")
     effects_base = _to_id_label_list(effects_raw)
-    effects_out = []
+    effects_out: List[Dict[str, Any]] = []
     for fx in effects_base:
         aid = fx["id"]
         effects_out.append(
@@ -284,16 +326,33 @@ def _build_suggest_response_option_a(
                 "id": aid,
                 "label": fx["label"],
                 "type": "filter",
-                "previewUrl": (f"{base}/assets/effects/{aid}" if has_preview("effects", aid) else None),
+                "previewUrl": (f"{base}/assets/{aid}" if has_preview("effects", aid) else None),
             }
         )
+
+    # Accessories unified (category = hats|glasses|masks)
+    accessories_out: List[Dict[str, Any]] = []
+
+    def add_accessories(category: str, default_params: Dict[str, Any]):
+        for it in cat_items(category):
+            accessories_out.append(
+                {
+                    "id": it["id"],
+                    "label": it["label"],
+                    "category": category,
+                    "previewUrl": it["previewUrl"],
+                    "params": default_params,
+                }
+            )
+
+    add_accessories("glasses", {"anchor": "eyes"})
+    add_accessories("hats", {"anchor": "head"})
+    add_accessories("masks", {"anchor": "face"})
 
     return {
         "backgrounds": backgrounds_out,
         "effects": effects_out,
-        "hats": cat_items("hats"),
-        "glasses": cat_items("glasses"),
-        "masks": cat_items("masks"),
+        "accessories": accessories_out,
     }
 
 
@@ -320,7 +379,6 @@ async def lifespan_assets_only(app: FastAPI):
     app.state.asset_options = load_all_assets(ASSET_DIRS)
     app.state.asset_preview_index = build_asset_preview_index(ASSET_DIRS)
 
-    # log counts to detect missing assets in Docker
     idx = app.state.asset_preview_index
     print(
         "[AI] Assets loaded. "
@@ -373,7 +431,6 @@ async def health_get():
     }
 
 
-# NEW: Option A preview endpoint
 @app.get("/assets/{category}/{asset_id}")
 async def get_asset_preview(category: str, asset_id: str):
     if category not in ALLOWED_CATEGORIES:
@@ -388,7 +445,6 @@ async def get_asset_preview(category: str, asset_id: str):
     if not meta:
         raise HTTPException(status_code=404, detail="Asset not found")
 
-    # meta contains internal path + mime; never return the path
     path = meta.get("path")
     mime = meta.get("mime") or "application/octet-stream"
     if not path or not os.path.isfile(path):
@@ -409,7 +465,7 @@ async def get_asset_preview(category: str, asset_id: str):
 async def suggest(request: Request, file: UploadFile = File(...)) -> JSONResponse:
     """
     Must be fast and must not trigger model loading.
-    Now returns SHORT HTTP preview URLs (Option A).
+    Returns short HTTP preview URLs (Option A).
     """
     _ = await _read_upload(file)
 
@@ -427,6 +483,7 @@ async def process(
     file: UploadFile = File(...),
     backgroundId: Optional[str] = Form(default=None),
     effects: Optional[List[str]] = Form(default=None),
+    accessories: Optional[str] = Form(default=None),  # NEW: JSON string
 ) -> Response:
     file_bytes = await _read_upload(file)
 
@@ -439,15 +496,22 @@ async def process(
     await _ensure_models_loaded(app)
 
     backgroundId = _normalize_override(backgroundId)
+
+    # effects are repeated fields in multipart (effects=confetti, effects=hearts, ...)
     effects_norm = [e for e in (effects or []) if _normalize_override(e)]
     effect_override = effects_norm[0] if effects_norm else None
+
+    # accessories are sent as ONE json field (string)
+    accessories_list = _parse_accessories_json(accessories)
+    accessory_ids = [a.get("id") for a in accessories_list if isinstance(a.get("id"), str)]
+    accessory_override = accessory_ids[0] if accessory_ids else None
 
     try:
         results = app_pipeline.process_image(
             input_image,
             backgroundId,
             effect_override,
-            None,
+            accessory_override,
         )
     except HTTPException:
         raise
@@ -467,6 +531,7 @@ async def process_image_endpoint(
     background_override: str | None = Form(None),
     effect_override: str | None = Form(None),
     accessory_override: str | None = Form(None),
+    accessories: str | None = Form(None),  # NEW: optional json field
 ):
     try:
         file_bytes = await image.read()
@@ -480,6 +545,11 @@ async def process_image_endpoint(
     background_override = _normalize_override(background_override)
     effect_override = _normalize_override(effect_override)
     accessory_override = _normalize_override(accessory_override)
+
+    accessories_list = _parse_accessories_json(accessories)
+    accessory_ids = [a.get("id") for a in accessories_list if isinstance(a.get("id"), str)]
+    if accessory_ids:
+        accessory_override = accessory_ids[0]
 
     try:
         results = app_pipeline.process_image(
