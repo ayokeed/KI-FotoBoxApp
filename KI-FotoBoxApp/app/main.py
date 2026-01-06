@@ -327,6 +327,8 @@ def _build_suggest_response_option_a(
                 "label": fx["label"],
                 "type": "filter",
                 "previewUrl": (f"{base}/assets/{aid}" if has_preview("effects", aid) else None),
+                #"previewUrl": (f"{base}/assets/effects/{aid}" if has_preview("effects", aid) else None),
+
             }
         )
 

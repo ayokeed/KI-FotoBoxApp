@@ -1,11 +1,11 @@
-# pipeline/image_pipeline.py  (UPDATED - absolute event dirs via asset_dirs + no OpenCV imread WARN spam)
+# pipeline/image_pipeline.py  (UPDATED - accessory overrides actually applied + category resolution)
 from __future__ import annotations
 
 import os
 import time
 import cv2
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 
 from pipeline.image_utils import draw_faces
 from pipeline import global_vars
@@ -17,6 +17,7 @@ from pipeline import global_vars
 
 def _norm_id(x: Optional[str]) -> str:
     return (x or "").strip()
+
 
 def _try_find_file_by_id(
     dir_path: str,
@@ -35,6 +36,7 @@ def _try_find_file_by_id(
         if os.path.isfile(p):
             return p
     return None
+
 
 def _resolve_asset_file(
     asset_id: str,
@@ -70,6 +72,7 @@ def _resolve_asset_file(
     print(msg)
     return None, None
 
+
 def _safe_fallback_suggestions():
     from models.image_tags import ImageTagsResponse, ImageTags
 
@@ -79,7 +82,32 @@ def _safe_fallback_suggestions():
         suggestion3=ImageTags(Background="none", Hats="none", Glasses="none", Effects="none", Masks="none"),
     )
 
+
+def _classify_accessory_id(asset_dirs: Dict[str, str], accessory_id: str) -> str:
+    """
+    Decide which category an accessory belongs to by checking the filesystem.
+    Returns: "hats" | "glasses" | "masks" | "" (unknown)
+    """
+    acc = _norm_id(accessory_id)
+    if not acc or acc.lower() == "none":
+        return ""
+
+    hats_dir = asset_dirs.get("hats", "")
+    glasses_dir = asset_dirs.get("glasses", "")
+    masks_dir = asset_dirs.get("masks", "")
+
+    if _try_find_file_by_id(hats_dir, acc, exts=(".png",)):
+        return "hats"
+    if _try_find_file_by_id(glasses_dir, acc, exts=(".png",)):
+        return "glasses"
+    if _try_find_file_by_id(masks_dir, acc, exts=(".png",)):
+        return "masks"
+
+    return ""
+
+
 def _single_suggestion_from_overrides(
+    asset_dirs: Dict[str, str],
     background_override: Optional[str],
     effect_override: Optional[str],
     accessory_override: Optional[str],
@@ -87,17 +115,33 @@ def _single_suggestion_from_overrides(
     """
     Creates a single deterministic "suggestion-like" object from overrides,
     so we can reuse the existing apply logic without calling OpenAI.
+
+    IMPORTANT CHANGE:
+    - accessory_override is now actually applied by mapping it to Hats/Glasses/Masks
+      depending on which folder contains the asset id.
     """
     from models.image_tags import ImageTags
 
     bg = _norm_id(background_override) or "none"
     eff = _norm_id(effect_override) or "none"
+    acc = _norm_id(accessory_override)
 
-    # Accessory override not used yet (kept for compatibility)
-    if _norm_id(accessory_override):
-        return ImageTags(Background=bg, Hats="none", Glasses="none", Effects=eff, Masks="none")
+    hats = "none"
+    glasses = "none"
+    masks = "none"
 
-    return ImageTags(Background=bg, Hats="none", Glasses="none", Effects=eff, Masks="none")
+    if acc:
+        cat = _classify_accessory_id(asset_dirs, acc)
+        if cat == "hats":
+            hats = acc
+        elif cat == "glasses":
+            glasses = acc
+        elif cat == "masks":
+            masks = acc
+        else:
+            print(f"[DEBUG] accessory_override='{acc}' not found in hats/glasses/masks -> ignored")
+
+    return ImageTags(Background=bg, Hats=hats, Glasses=glasses, Effects=eff, Masks=masks)
 
 
 # ----------------------------
@@ -198,7 +242,10 @@ class ImagePipeline:
             for x in (background_override, effect_override, accessory_override)
         )
 
-        print(f"[DEBUG] overrides: background='{_norm_id(background_override)}' effect='{_norm_id(effect_override)}' accessory='{_norm_id(accessory_override)}'")
+        print(
+            f"[DEBUG] overrides: background='{_norm_id(background_override)}' "
+            f"effect='{_norm_id(effect_override)}' accessory='{_norm_id(accessory_override)}'"
+        )
         print(f"[DEBUG] strict_override_assets={self.strict_override_assets}")
         print(f"[DEBUG] base asset_dirs={self.asset_dirs}")
 
@@ -217,7 +264,12 @@ class ImagePipeline:
 
         # If overrides present, skip suggestions entirely and process exactly one output
         if has_overrides:
-            suggestion = _single_suggestion_from_overrides(background_override, effect_override, accessory_override)
+            suggestion = _single_suggestion_from_overrides(
+                asset_dirs=self.asset_dirs,
+                background_override=background_override,
+                effect_override=effect_override,
+                accessory_override=accessory_override,
+            )
             edited = self._apply_one(image, faces, suggestion, background_override, effect_override)
             print(f"Total deterministic processing time: {time.time() - overall_start:.3f} seconds.")
             return [edited]
@@ -280,13 +332,6 @@ class ImagePipeline:
         return results
 
     def _apply_one(self, image, faces, suggestion, background_override, effect_override):
-        """
-        Apply one suggestion deterministically.
-        - Supports BOTH event_* and normal asset folders.
-        - Uses asset_dirs["event_*"] if present (no hardcoded relative paths).
-        - Avoids OpenCV WARN spam by testing existence with os.path.isfile.
-        - Lazy loads bg remover only if background replacement is actually needed.
-        """
         edited_image = image.copy()
 
         # Apply explicit overrides to suggestion
@@ -321,7 +366,7 @@ class ImagePipeline:
             )
 
             if bg_path:
-                bg_img = cv2.imread(bg_path)  # background should be BGR 3ch
+                bg_img = cv2.imread(bg_path)
                 if bg_img is None:
                     msg = f"Background '{bg_id}' resolved to '{bg_path}' but cv2.imread returned None."
                     if self.strict_override_assets and bool(bg_override):
@@ -330,10 +375,9 @@ class ImagePipeline:
                 else:
                     print(f"[DEBUG] background resolved ({where}) -> {bg_path}")
 
-                    self._ensure_bg_remover()  # lazy load MODNet only now
+                    self._ensure_bg_remover()
 
                     bg_img = cv2.resize(bg_img, (edited_image.shape[1], edited_image.shape[0]))
-
                     mask = self.bg_remover.remove_background(edited_image)
 
                     if mask is None:
@@ -342,7 +386,6 @@ class ImagePipeline:
                             raise ValueError(msg)
                         print(msg)
                     else:
-                        # Ensure mask is single channel uint8
                         if len(mask.shape) == 3:
                             mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
                         if mask.dtype != "uint8":
@@ -384,7 +427,6 @@ class ImagePipeline:
 
             if eff_path:
                 print(f"[DEBUG] effect resolved ({where}) -> {eff_path}")
-                # Ensure accessory_placer resolves from the correct directory
                 try:
                     self.accessory_placer.asset_dirs["effects"] = event_eff_dir if where == "primary" else fallback_eff_dir
                 except Exception:
